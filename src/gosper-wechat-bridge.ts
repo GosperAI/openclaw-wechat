@@ -468,6 +468,9 @@ class GosperWechatBridge {
       asRecord(args.bindCallbackContext) ??
       asRecord(args.bind_callback_context) ??
       triggerContext;
+    // The bridge is shared by a whole team, so each bind session must carry the
+    // Gosper user that initiated it. Later poll and callback operations use this
+    // owner to keep one user's WeChat token/cursor separate from another's.
     const owner = ownerIdentityFrom(
       args,
       context,
@@ -544,6 +547,8 @@ class GosperWechatBridge {
     if (!session) throw new Error(`Unknown WeChat bind session ${sessionKey}.`);
     const requestOwner = ownerIdentityFrom(args, context);
     const sessionOwner = ownerIdentityFrom(session.owner, session);
+    // A user must not be able to poll or submit verification for another
+    // user's QR session just by guessing a session id.
     if (
       requestOwner &&
       sessionOwner &&
@@ -596,6 +601,8 @@ class GosperWechatBridge {
       session.bindCallbackContext,
       session.triggerContext,
     );
+    // Account ids come from iLink and are not necessarily unique per Gosper
+    // user. Store them under an owner-scoped key when owner context exists.
     const previousEntry = findAccountEntryByAccountId(
       this.store.state.accounts,
       accountId,
@@ -644,6 +651,9 @@ class GosperWechatBridge {
     };
     const nextKey = accountStorageKey(accountId, owner);
     this.store.state.accounts[nextKey] = next;
+    // Older state files used the raw account id as the key. Once the same
+    // account is confirmed with owner context, move that legacy entry into the
+    // scoped slot so future lookups cannot collide across users.
     if (
       previousEntry &&
       previousEntry.key !== nextKey &&
@@ -715,6 +725,9 @@ class GosperWechatBridge {
 
   findDeliveryAccount(args, context) {
     const owner = ownerIdentityFrom(args, context);
+    // Outbound delivery always starts inside the Gosper user scope when the
+    // caller supplies it. This is what lets one team deployment serve many
+    // users without leaking replies to another user's WeChat account.
     const candidates = [
       stringValue(args.wechatBotId),
       stringValue(args.wechat_bot_id),
@@ -930,6 +943,8 @@ function latestConnectedAccountForOwner(accounts, owner) {
     .sort((a, b) => String(b.updatedAt ?? "").localeCompare(String(a.updatedAt ?? "")));
   if (owner) {
     if (connected.length) return connected[0];
+    // Compatibility for pre-owner state files: use an unscoped legacy account
+    // only when it is the single possible account, otherwise fail closed.
     const legacyConnected = accountRecords(accounts)
       .map((entry) => entry.account)
       .filter(
@@ -970,6 +985,8 @@ function findAccountEntryByAccountId(accounts, accountId, owner) {
     if (ownerMatches.length > 1) {
       return mostRecentlyUpdatedEntry(ownerMatches);
     }
+    // Legacy unscoped records are safe only when there is exactly one match.
+    // Multiple matches mean the request must provide a stronger account hint.
     const legacyMatches = matches.filter(({ account }) => accountOwnerAbsent(account));
     if (legacyMatches.length === 1) return legacyMatches[0];
   }
@@ -1012,6 +1029,7 @@ function mostRecentlyUpdatedEntry(entries) {
 function accountStorageKey(accountId, owner) {
   const id = stringValue(accountId);
   if (!id) throw new Error("WeChat account storage requires accountId.");
+  // Keep the raw id for legacy/unowned records, but never for per-user records.
   return owner?.ownerKey ? `owner:${owner.ownerKey}:${id}` : id;
 }
 
@@ -1027,6 +1045,9 @@ function accountOwnerAbsent(account) {
 }
 
 function ownerIdentityFrom(...values) {
+  // Gosper may send the user identity in args, context, triggerContext, or an
+  // echoed callback payload. Walk those shapes shallowly instead of assuming a
+  // single envelope format.
   for (const value of values) {
     const owner = ownerIdentityFromRecord(asRecord(value), 0, new Set());
     if (owner) return owner;
